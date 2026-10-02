@@ -61,6 +61,73 @@ def hash_uploads(*files):
     return h.hexdigest()
 
 
+def add_usd_equivalent(df: pd.DataFrame):
+    """
+    Add a transaction-time USD equivalent without using today's market FX.
+
+    Rules:
+    - USD rows: use ERP foreign-currency sales amount directly.
+    - Non-USD rows (e.g. EUR): use booked KRW sales amount divided by an ERP-derived
+      USD/KRW accounting rate for the same transaction date.
+    - If no USD transaction exists on that date, use the median ERP USD/KRW rate
+      for that year-month.
+    - If no suitable USD reference exists, leave USD equivalent blank rather than
+      guessing.
+    """
+    out = df.copy()
+    out["currency"] = out.get("currency", pd.Series(index=out.index, dtype=object)).fillna("").astype(str).str.strip().str.upper()
+    out["fx_rate"] = pd.to_numeric(out.get("fx_rate"), errors="coerce")
+    out["sales_amount_fc"] = pd.to_numeric(out.get("sales_amount_fc"), errors="coerce")
+    out["sales_amount_krw"] = pd.to_numeric(out.get("sales_amount_krw"), errors="coerce").fillna(0)
+    out["txn_date"] = pd.to_datetime(out.get("txn_date"), errors="coerce")
+
+    sales_mask = out["source_type"].eq("SALES")
+    usd_ref_source = out[
+        sales_mask
+        & out["currency"].eq("USD")
+        & out["fx_rate"].gt(0)
+        & out["txn_date"].notna()
+    ].copy()
+
+    daily_rate = usd_ref_source.groupby(
+        usd_ref_source["txn_date"].dt.normalize()
+    )["fx_rate"].median()
+
+    monthly_rate = usd_ref_source.groupby(
+        usd_ref_source["txn_date"].dt.to_period("M").astype(str)
+    )["fx_rate"].median()
+
+    date_key = out["txn_date"].dt.normalize()
+    month_key = out["txn_date"].dt.to_period("M").astype(str)
+    out["usd_krw_reference"] = date_key.map(daily_rate)
+    out["usd_krw_reference"] = out["usd_krw_reference"].fillna(month_key.map(monthly_rate))
+
+    out["sales_amount_usd"] = pd.NA
+    usd_sales = sales_mask & out["currency"].eq("USD")
+    out.loc[usd_sales, "sales_amount_usd"] = out.loc[usd_sales, "sales_amount_fc"]
+
+    non_usd_sales = (
+        sales_mask
+        & ~out["currency"].eq("USD")
+        & out["usd_krw_reference"].gt(0)
+    )
+    out.loc[non_usd_sales, "sales_amount_usd"] = (
+        out.loc[non_usd_sales, "sales_amount_krw"]
+        / out.loc[non_usd_sales, "usd_krw_reference"]
+    )
+
+    out["sales_amount_usd"] = pd.to_numeric(out["sales_amount_usd"], errors="coerce")
+    missing_conversion = int(
+        (
+            sales_mask
+            & ~out["currency"].eq("USD")
+            & out["sales_amount_krw"].ne(0)
+            & out["sales_amount_usd"].isna()
+        ).sum()
+    )
+    return out, missing_conversion
+
+
 require_app_password()
 
 st.title("Africa Sales DB")
@@ -76,8 +143,8 @@ if page == "Dashboard":
         st.stop()
 
     df["txn_date"] = pd.to_datetime(df["txn_date"], errors="coerce")
-    df["sales_amount_krw"] = pd.to_numeric(df["sales_amount_krw"], errors="coerce").fillna(0)
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
+    df, missing_usd_conversion = add_usd_equivalent(df)
 
     with st.sidebar:
         countries = sorted(df["country_name"].dropna().unique().tolist()) if "country_name" in df else []
@@ -91,32 +158,79 @@ if page == "Dashboard":
     if selected_managers:
         view = view[view["current_manager"].isin(selected_managers)]
 
-    sales = view[view["source_type"].eq("SALES")]
+    sales = view[view["source_type"].eq("SALES")].copy()
     foc = view[view["source_type"].eq("BL_FOC")]
     devices = view[view.get("product_category", pd.Series(index=view.index, dtype=str)).eq("Device")]
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Sales (KRW)", f"₩{sales['sales_amount_krw'].sum():,.0f}")
-    c2.metric("Sales rows", f"{len(sales):,}")
-    c3.metric("FOC Qty", f"{foc['qty'].sum():,.0f}")
-    c4.metric("Device Qty", f"{devices['qty'].sum():,.0f}")
+    c2.metric("Sales (USD eq.)", f"${sales['sales_amount_usd'].sum():,.0f}")
+    c3.metric("Sales rows", f"{len(sales):,}")
+    c4.metric("FOC Qty", f"{foc['qty'].sum():,.0f}")
+    c5.metric("Device Qty", f"{devices['qty'].sum():,.0f}")
 
-    st.subheader("Country Summary")
-    summary = (
-        view.groupby(["country_name", "current_manager"], dropna=False)
+    st.caption(
+        "USD equivalent uses ERP transaction/accounting FX, not today's exchange rate. "
+        "USD rows use the original foreign-currency sales amount. Non-USD rows are converted "
+        "from booked KRW using the ERP USD/KRW rate on the same date; if unavailable, the "
+        "same month's median ERP USD/KRW rate is used."
+    )
+    if missing_usd_conversion:
+        st.warning(
+            f"{missing_usd_conversion:,} non-USD sales rows could not be converted to USD "
+            "because no ERP USD/KRW reference rate was available for the transaction date/month."
+        )
+
+    st.subheader("Currency Check")
+    currency_summary = (
+        sales.groupby("currency", dropna=False)
         .agg(
-            sales_krw=("sales_amount_krw", lambda s: s[view.loc[s.index, "source_type"].eq("SALES")].sum()),
-            total_qty=("qty", "sum"),
+            rows=("currency", "size"),
+            native_sales=("sales_amount_fc", "sum"),
+            booked_krw=("sales_amount_krw", "sum"),
+            usd_equivalent=("sales_amount_usd", "sum"),
         )
         .reset_index()
+        .sort_values("booked_krw", ascending=False)
+    )
+    st.dataframe(currency_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("Country Summary")
+    qty_summary = (
+        view.groupby(["country_name", "current_manager"], dropna=False)
+        .agg(total_qty=("qty", "sum"))
+        .reset_index()
+    )
+    sales_summary = (
+        sales.groupby(["country_name", "current_manager"], dropna=False)
+        .agg(
+            sales_krw=("sales_amount_krw", "sum"),
+            sales_usd=("sales_amount_usd", "sum"),
+        )
+        .reset_index()
+    )
+    summary = (
+        qty_summary.merge(
+            sales_summary,
+            on=["country_name", "current_manager"],
+            how="left",
+        )
+        .fillna({"sales_krw": 0, "sales_usd": 0})
         .sort_values("sales_krw", ascending=False)
     )
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
     st.subheader("Recent Data")
-    show_cols = [c for c in ["txn_date", "country_name", "customer_name", "item_name", "qty",
-                                  "sales_amount_krw", "shipment_type", "current_manager", "manager_at_sale"] if c in view]
-    st.dataframe(view.sort_values("txn_date", ascending=False)[show_cols].head(300), use_container_width=True, hide_index=True)
+    show_cols = [c for c in [
+        "txn_date", "country_name", "customer_name", "item_name", "currency", "fx_rate",
+        "qty", "sales_amount_fc", "sales_amount_krw", "sales_amount_usd", "shipment_type",
+        "current_manager", "manager_at_sale"
+    ] if c in view]
+    st.dataframe(
+        view.sort_values("txn_date", ascending=False)[show_cols].head(300),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 elif page == "ERP Upload":
     st.header("ERP Upload")
