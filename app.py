@@ -114,12 +114,17 @@ st.caption("Sales Report → Monthly Sales DB → Dashboard")
 
 page = st.sidebar.radio(
     "Menu",
-    ["Dashboard", "Sales Report Upload"],
+    ["Sales Report Upload", "Dashboard"],
 )
 
 
 if page == "Dashboard":
-    df = load_dashboard_data(sb)
+    try:
+        df = load_dashboard_data(sb)
+    except Exception as exc:
+        st.error("새 Sales DB를 아직 읽지 못했습니다. 먼저 Sales Report Upload에서 2025 파일을 업로드해주세요.")
+        st.caption("Supabase에서 customer_master, product_catalog, sales_monthly 테이블이 생성되어 있는지도 확인해주세요.")
+        st.stop()
 
     if df.empty:
         st.info("아직 Sales Report 데이터가 없습니다. 먼저 Sales Report Upload에서 파일을 업로드해주세요.")
