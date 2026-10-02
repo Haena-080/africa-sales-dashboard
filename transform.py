@@ -82,35 +82,52 @@ def read_sales_report(file_obj) -> Tuple[pd.DataFrame, Dict]:
 
     dim_cols = {key: col_by_name[label] for key, label in DIMENSION_NAMES.items()}
 
-    # Detect monthly 3-column groups from the row immediately above the metric headers.
-    month_groups = {}
-    current_month = None
-    for col_idx in range(dim_cols["item_code"] + 1, len(header)):
-        marker = month_row[col_idx] if col_idx < len(month_row) else None
-        if marker is not None:
-            try:
-                month_num = int(float(marker))
-                if 1 <= month_num <= 12:
-                    current_month = month_num
-            except (TypeError, ValueError):
-                pass
+    # Detect monthly 3-column groups robustly.
+    # The report repeats [수량, 외화금액, 원화금액] for each month.
+    # We prefer the explicit month row when available, but fall back to the
+    # repeated metric pattern so merged/pivot headers do not break parsing.
+    metric_groups = []
+    current_group = {}
 
-        metric = header[col_idx] if col_idx < len(header) else None
-        if current_month and metric:
-            metric_compact = metric.replace(" ", "")
-            if "수량" in metric_compact:
-                month_groups.setdefault(current_month, {})["qty"] = col_idx
-            elif "외화금액" in metric_compact:
-                month_groups.setdefault(current_month, {})["sales_usd"] = col_idx
-            elif "원화금액" in metric_compact:
-                month_groups.setdefault(current_month, {})["sales_krw"] = col_idx
+    for col_idx in range(dim_cols["item_code"] + 1, len(header)):
+        metric = header[col_idx]
+        metric_compact = metric.replace(" ", "") if metric else ""
+
+        kind = None
+        if "수량" in metric_compact:
+            kind = "qty"
+        elif "외화금액" in metric_compact:
+            kind = "sales_usd"
+        elif "원화금액" in metric_compact:
+            kind = "sales_krw"
+
+        if not kind:
+            continue
+
+        # A new qty column starts the next 3-column metric group.
+        if kind == "qty" and current_group:
+            if {"qty", "sales_usd", "sales_krw"}.issubset(current_group):
+                metric_groups.append(current_group)
+            current_group = {}
+
+        current_group[kind] = col_idx
+
+        if {"qty", "sales_usd", "sales_krw"}.issubset(current_group):
+            metric_groups.append(current_group)
+            current_group = {}
+
+    # The first 12 complete triplets are Jan-Dec.
+    # Any later triplet is the grand total and is intentionally ignored.
+    if len(metric_groups) < 12:
+        raise ValueError(
+            f"월별 수량/외화금액/원화금액 묶음을 12개 찾지 못했습니다. "
+            f"현재 {len(metric_groups)}개를 찾았습니다."
+        )
 
     complete_months = {
-        m: cols for m, cols in month_groups.items()
-        if {"qty", "sales_usd", "sales_krw"}.issubset(cols)
+        month: metric_groups[month - 1]
+        for month in range(1, 13)
     }
-    if not complete_months:
-        raise ValueError("1~12월 수량/외화금액/원화금액 열을 찾지 못했습니다.")
 
     data = raw.iloc[header_row + 1:].copy().reset_index(drop=True)
 
