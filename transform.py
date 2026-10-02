@@ -1,165 +1,203 @@
-import hashlib
 import re
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Tuple
 
 import pandas as pd
 
 
-COLUMN_CANDIDATES = {
-    "txn_date": ["매출일", "BL 일자", "BL일자", "출고일", "일자"],
-    "hq": ["본부"],
-    "department": ["부서"],
-    "original_sales_rep": ["영업담당자", "담당자"],
-    "raw_country": ["국가", "국가명", "Country", "COUNTRY"],
-    "customer_name": ["거래처", "Buyer", "BUYER", "거래처명", "판매처", "판매처명"],
-    "invoice_no": ["INVOICE NO", "INVOICE NO.", "Invoice No", "Invoice No."],
-    "item_code": ["품번", "품목코드", "Item Code", "ITEM CODE"],
-    "item_name": ["품명", "품목명", "Item Name", "ITEM NAME"],
-    "spec": ["규격", "Spec", "SPEC"],
-    "sales_unit": ["판매단위", "단위", "Unit", "UNIT"],
-    "currency": ["통화", "Currency", "CURRENCY"],
-    "fx_rate": ["환율", "Exchange Rate", "EXCHANGE RATE"],
-    "qty": ["수량", "출고수량", "매출수량", "QTY", "Qty"],
-    "sales_amount_fc": ["판매금액", "외화판매금액", "외화금액", "Sales Amount"],
-    "sales_amount_krw": ["원화판매금액", "원화금액", "KRW 판매금액", "Sales Amount(KRW)"],
-    "lot_no": ["LOTNo", "LOT No", "LOT NO", "Lot No"],
-    "other_shipment_type": ["기타출고구분(New)", "기타출고구분", "기타 출고 구분"],
-}
-
-TARGET_DEPARTMENTS = {"아프리카팀"}
-
-CUSTOMER_COUNTRY_OVERRIDES = {
-    "Quilaban,S,A_GUINÉ-BISSAU": "Guinea-Bissau",
-}
-
-COUNTRY_ALIASES = {
-    "CABO VERDE": "Cape Verde",
+DIMENSION_NAMES = {
+    "region": "지역",
+    "country": "국가",
+    "manager": "담당자",
+    "customer_name": "거래처",
+    "customer_code": "거래처번호",
+    "category": "대분류",
+    "product_group": "Level 3",
+    "platform": "플랫폼",
+    "item_name": "제품",
+    "lot_no": "Lot No.",
+    "item_code": "품번",
 }
 
 
-def _clean_col(v) -> str:
-    if pd.isna(v):
-        return ""
-    return re.sub(r"\s+", " ", str(v)).strip()
+def _clean_text(value):
+    if pd.isna(value):
+        return None
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return None
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
 
 
-def _detect_header_row(file_obj, sheet_name=0, max_scan_rows: int = 12) -> int:
-    preview = pd.read_excel(file_obj, sheet_name=sheet_name, header=None, nrows=max_scan_rows)
-    best_row, best_score = 0, -1
-    markers = {"품번", "품명", "수량", "INVOICE NO", "거래처", "Buyer", "매출일", "BL 일자"}
-    for i in range(len(preview)):
-        values = {_clean_col(x) for x in preview.iloc[i].tolist()}
-        score = sum(1 for m in markers if m in values)
-        if score > best_score:
-            best_row, best_score = i, score
-    return best_row
+def _find_header_row(raw: pd.DataFrame) -> int:
+    """Find the row containing the stable pivot headers."""
+    for idx in range(min(len(raw), 80)):
+        values = {_clean_text(v) for v in raw.iloc[idx].tolist()}
+        if "거래처번호" in values and "품번" in values:
+            return idx
+    raise ValueError("헤더 행을 찾지 못했습니다. '거래처번호'와 '품번'이 있는 Sales Report인지 확인해주세요.")
 
 
-def read_erp_excel(file_obj, sheet_name=0) -> pd.DataFrame:
+def _find_year(raw: pd.DataFrame, header_row: int) -> int:
+    """Find a four-digit year above the pivot header."""
+    for r in range(header_row):
+        for value in raw.iloc[r].tolist():
+            text = _clean_text(value)
+            if text and re.fullmatch(r"20\d{2}", text):
+                return int(text)
+    raise ValueError("Sales Report에서 연도를 찾지 못했습니다.")
+
+
+def read_sales_report(file_obj) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Convert the pivot-style Sales Report into normalized monthly rows.
+
+    Key rules:
+    - Customer identity = 거래처번호
+    - Product identity = 품번
+    - USD sales = 월별 외화금액 as supplied in the report (already USD-based)
+    - Invoice / LOT are not used in the monthly fact table
+    - Only leaf product rows with a 품번 are kept; subtotal/요약 rows are excluded
+    """
     if hasattr(file_obj, "seek"):
         file_obj.seek(0)
-    header_row = _detect_header_row(file_obj, sheet_name=sheet_name)
-    if hasattr(file_obj, "seek"):
-        file_obj.seek(0)
-    df = pd.read_excel(file_obj, sheet_name=sheet_name, header=header_row)
-    df.columns = [_clean_col(c) for c in df.columns]
-    df = df.dropna(how="all").copy()
-    return df
+    raw = pd.read_excel(file_obj, sheet_name=0, header=None)
+    raw = raw.dropna(how="all").reset_index(drop=True)
 
+    header_row = _find_header_row(raw)
+    year = _find_year(raw, header_row)
 
-def detect_mapping(columns: Iterable[str]) -> Dict[str, Optional[str]]:
-    cols = {_clean_col(c): c for c in columns}
-    mapping: Dict[str, Optional[str]] = {}
-    for canonical, candidates in COLUMN_CANDIDATES.items():
-        hit = None
-        for candidate in candidates:
-            if candidate in cols:
-                hit = cols[candidate]
-                break
-        mapping[canonical] = hit
-    return mapping
+    header = [_clean_text(v) for v in raw.iloc[header_row].tolist()]
+    month_row = [_clean_text(v) for v in raw.iloc[header_row - 1].tolist()]
 
+    col_by_name = {}
+    for idx, value in enumerate(header):
+        if value:
+            col_by_name.setdefault(value, idx)
 
-def _series_or_blank(df: pd.DataFrame, col: Optional[str]):
-    if col and col in df.columns:
-        return df[col]
-    return pd.Series([None] * len(df), index=df.index)
+    missing = [label for label in DIMENSION_NAMES.values() if label not in col_by_name]
+    if missing:
+        raise ValueError(f"필수 열이 없습니다: {', '.join(missing)}")
 
+    dim_cols = {key: col_by_name[label] for key, label in DIMENSION_NAMES.items()}
 
-def _infer_country(customer_name):
-    if customer_name is None or pd.isna(customer_name):
-        return None
-    customer = _clean_col(customer_name)
-    if not customer:
-        return None
+    # Detect monthly 3-column groups from the row immediately above the metric headers.
+    month_groups = {}
+    current_month = None
+    for col_idx in range(dim_cols["item_code"] + 1, len(header)):
+        marker = month_row[col_idx] if col_idx < len(month_row) else None
+        if marker is not None:
+            try:
+                month_num = int(float(marker))
+                if 1 <= month_num <= 12:
+                    current_month = month_num
+            except (TypeError, ValueError):
+                pass
 
-    if customer in CUSTOMER_COUNTRY_OVERRIDES:
-        country = CUSTOMER_COUNTRY_OVERRIDES[customer]
-    elif ";" in customer:
-        country = customer.rsplit(";", 1)[1].strip()
-    else:
-        return None
+        metric = header[col_idx] if col_idx < len(header) else None
+        if current_month and metric:
+            metric_compact = metric.replace(" ", "")
+            if "수량" in metric_compact:
+                month_groups.setdefault(current_month, {})["qty"] = col_idx
+            elif "외화금액" in metric_compact:
+                month_groups.setdefault(current_month, {})["sales_usd"] = col_idx
+            elif "원화금액" in metric_compact:
+                month_groups.setdefault(current_month, {})["sales_krw"] = col_idx
 
-    return COUNTRY_ALIASES.get(country, country)
+    complete_months = {
+        m: cols for m, cols in month_groups.items()
+        if {"qty", "sales_usd", "sales_krw"}.issubset(cols)
+    }
+    if not complete_months:
+        raise ValueError("1~12월 수량/외화금액/원화금액 열을 찾지 못했습니다.")
 
+    data = raw.iloc[header_row + 1:].copy().reset_index(drop=True)
 
-def canonicalize(df: pd.DataFrame, source_type: str) -> Tuple[pd.DataFrame, Dict[str, Optional[str]]]:
-    mapping = detect_mapping(df.columns)
-    out = pd.DataFrame(index=df.index)
-    for canonical in COLUMN_CANDIDATES:
-        out[canonical] = _series_or_blank(df, mapping.get(canonical))
-
-    total_mask = pd.Series(False, index=df.index)
-    for candidate in [mapping.get("hq"), mapping.get("customer_name"), mapping.get("item_name")]:
-        if candidate and candidate in df.columns:
-            total_mask = total_mask | df[candidate].astype(str).str.strip().str.upper().eq("TOTAL")
-    out = out.loc[~total_mask].copy()
-
-    out["txn_date"] = pd.to_datetime(out["txn_date"], errors="coerce").dt.date
-    for c in ["qty", "fx_rate", "sales_amount_fc", "sales_amount_krw"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    for c in ["raw_country", "customer_name", "invoice_no", "item_code", "item_name", "spec",
-              "sales_unit", "currency", "lot_no", "other_shipment_type", "original_sales_rep",
-              "department", "hq"]:
-        out[c] = out[c].where(out[c].notna(), None)
-        out[c] = out[c].map(lambda x: _clean_col(x) if x is not None else None)
-        out[c] = out[c].replace({"": None, "nan": None, "None": None})
-
-    inferred = out["customer_name"].map(_infer_country)
-    out["raw_country"] = out["raw_country"].where(out["raw_country"].notna(), inferred)
-    out["raw_country"] = out["raw_country"].map(
-        lambda x: COUNTRY_ALIASES.get(x, x) if x is not None else None
-    )
-
-    other = out["other_shipment_type"].fillna("").astype(str).str.strip()
-    if source_type == "SALES":
-        out = out.loc[other.eq("")].copy()
-        out["shipment_type"] = "Sales"
-    elif source_type == "BL_FOC":
-        out = out.loc[~other.eq("")].copy()
-        out["shipment_type"] = out["other_shipment_type"].fillna("Other")
-    else:
-        raise ValueError("source_type must be SALES or BL_FOC")
-
-    out["source_type"] = source_type
-    return out.reset_index(drop=True), mapping
-
-
-def combine_company_rule(sales_df: pd.DataFrame, bl_df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
-    sales, sales_map = canonicalize(sales_df, "SALES")
-    bl, bl_map = canonicalize(bl_df, "BL_FOC")
-    combined = pd.concat([sales, bl], ignore_index=True)
-
-    if TARGET_DEPARTMENTS:
-        combined = combined.loc[combined["department"].isin(TARGET_DEPARTMENTS)].copy()
-
-    signature_cols = [
-        "txn_date", "raw_country", "customer_name", "invoice_no", "item_code", "item_name",
-        "qty", "sales_amount_fc", "sales_amount_krw", "lot_no", "other_shipment_type", "source_type"
+    # Pivot reports suppress repeated hierarchy labels. Forward-fill them.
+    hierarchical_keys = [
+        "region", "country", "manager", "customer_name", "customer_code",
+        "category", "product_group", "platform", "item_name",
     ]
-    sig = combined[signature_cols].fillna("").astype(str).agg("|".join, axis=1)
-    occurrence = sig.groupby(sig).cumcount().astype(str)
-    combined["transaction_key"] = [
-        hashlib.sha256(f"{s}|{n}".encode("utf-8")).hexdigest() for s, n in zip(sig, occurrence)
-    ]
-    return combined.reset_index(drop=True), {"sales": sales_map, "bl": bl_map}
+    dims = pd.DataFrame(index=data.index)
+    for key, col_idx in dim_cols.items():
+        dims[key] = data.iloc[:, col_idx].map(_clean_text)
+
+    for key in hierarchical_keys:
+        dims[key] = dims[key].ffill()
+
+    # 품번 is the leaf-level product key. Blank 품번 means subtotal/header row.
+    leaf_mask = dims["item_code"].notna()
+    data = data.loc[leaf_mask].reset_index(drop=True)
+    dims = dims.loc[leaf_mask].reset_index(drop=True)
+
+    monthly_parts = []
+    for month, cols in sorted(complete_months.items()):
+        part = dims[
+            [
+                "region", "country", "manager", "customer_name", "customer_code",
+                "category", "product_group", "platform", "item_name", "item_code",
+            ]
+        ].copy()
+
+        part["sales_month"] = pd.Timestamp(year=year, month=month, day=1).date()
+        part["qty"] = pd.to_numeric(data.iloc[:, cols["qty"]], errors="coerce").fillna(0)
+        part["sales_usd"] = pd.to_numeric(data.iloc[:, cols["sales_usd"]], errors="coerce").fillna(0)
+        part["sales_krw"] = pd.to_numeric(data.iloc[:, cols["sales_krw"]], errors="coerce").fillna(0)
+
+        # Skip months where the leaf product had no movement at all.
+        movement = (
+            part["qty"].ne(0)
+            | part["sales_usd"].ne(0)
+            | part["sales_krw"].ne(0)
+        )
+        monthly_parts.append(part.loc[movement])
+
+    if not monthly_parts:
+        raise ValueError("월별 매출/수량 데이터가 없습니다.")
+
+    monthly = pd.concat(monthly_parts, ignore_index=True)
+
+    # Clean keys before grouping.
+    for col in [
+        "region", "country", "manager", "customer_name", "customer_code",
+        "category", "product_group", "platform", "item_name", "item_code",
+    ]:
+        monthly[col] = monthly[col].map(_clean_text)
+
+    monthly = monthly[
+        monthly["customer_code"].notna() & monthly["item_code"].notna()
+    ].copy()
+
+    # LOT is intentionally ignored. Multiple LOT rows become one customer/item/month row.
+    group_keys = ["sales_month", "customer_code", "item_code"]
+    agg = {
+        "region": "first",
+        "country": "first",
+        "manager": "first",
+        "customer_name": "first",
+        "category": "first",
+        "product_group": "first",
+        "platform": "first",
+        "item_name": "first",
+        "qty": "sum",
+        "sales_usd": "sum",
+        "sales_krw": "sum",
+    }
+    monthly = monthly.groupby(group_keys, as_index=False, dropna=False).agg(agg)
+
+    monthly["sales_usd"] = monthly["sales_usd"].round(2)
+    monthly["sales_krw"] = monthly["sales_krw"].round(0)
+    monthly["qty"] = monthly["qty"].round(3)
+
+    meta = {
+        "year": year,
+        "header_excel_row": header_row + 1,
+        "months_detected": sorted(complete_months),
+        "monthly_rows": int(len(monthly)),
+        "customer_count": int(monthly["customer_code"].nunique()),
+        "item_count": int(monthly["item_code"].nunique()),
+        "sales_usd": float(monthly["sales_usd"].sum()),
+        "sales_krw": float(monthly["sales_krw"].sum()),
+    }
+    return monthly, meta
