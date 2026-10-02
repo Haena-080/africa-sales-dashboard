@@ -42,6 +42,7 @@ def read_table(sb, table: str, columns: str = "*", page_size: int = 1000) -> pd.
         batch = (
             sb.table(table)
             .select(columns)
+            .order("id")
             .range(start, start + page_size - 1)
             .execute()
             .data
