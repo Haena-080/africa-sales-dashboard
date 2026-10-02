@@ -127,3 +127,23 @@ def upload_sales_report(sb: Client, monthly: pd.DataFrame, source_file: str) -> 
         "products": products,
         "sales_rows": sales_rows,
     }
+
+
+def upsert_business_plan(sb: Client, plan_df: pd.DataFrame, source_file: str) -> int:
+    rows = []
+    for rec in plan_df.to_dict("records"):
+        rows.append({
+            "plan_month": _clean_value(rec.get("plan_month")),
+            "manager": _clean_value(rec.get("manager")),
+            "customer_name": _clean_value(rec.get("customer_name")),
+            "country": _clean_value(rec.get("country")),
+            "plan_usd": float(rec.get("plan_usd") or 0),
+            "source_file": source_file,
+        })
+
+    for start in range(0, len(rows), 500):
+        sb.table("business_plan_monthly").upsert(
+            rows[start:start + 500],
+            on_conflict="plan_month,manager,customer_name",
+        ).execute()
+    return len(rows)
