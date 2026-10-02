@@ -1,12 +1,11 @@
-import hashlib
 import hmac
-from datetime import date
 
 import pandas as pd
 import streamlit as st
 
-from db import apply_manager_assignments, get_client, insert_sales_batch, upsert_products
-from transform import combine_company_rule, read_erp_excel
+from db import get_client, upload_sales_report
+from transform import read_sales_report
+
 
 st.set_page_config(page_title="Africa Sales DB", page_icon="🌍", layout="wide")
 
@@ -16,8 +15,10 @@ def require_app_password():
     if not expected:
         st.error("APP_PASSWORD is not configured in Streamlit Secrets.")
         st.stop()
+
     if st.session_state.get("authenticated"):
         return
+
     password = st.text_input("App password", type="password")
     if st.button("Sign in"):
         if hmac.compare_digest(password, expected):
@@ -29,293 +30,273 @@ def require_app_password():
 
 def sb_client():
     try:
-        return get_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_SECRET_KEY"])
+        return get_client(
+            st.secrets["SUPABASE_URL"],
+            st.secrets["SUPABASE_SECRET_KEY"],
+        )
     except Exception:
-        st.error("Supabase connection is not configured. Add SUPABASE_URL and SUPABASE_SECRET_KEY to Streamlit Secrets.")
+        st.error(
+            "Supabase connection is not configured. "
+            "Check SUPABASE_URL and SUPABASE_SECRET_KEY in Streamlit Secrets."
+        )
         st.stop()
 
 
-def read_table(sb, table: str, columns: str = "*", page_size: int = 1000) -> pd.DataFrame:
+def read_table(sb, table: str, order_col: str, page_size: int = 1000) -> pd.DataFrame:
     rows = []
     start = 0
+
     while True:
         batch = (
             sb.table(table)
-            .select(columns)
-            .order("id")
+            .select("*")
+            .order(order_col)
             .range(start, start + page_size - 1)
             .execute()
             .data
             or []
         )
         rows.extend(batch)
+
         if len(batch) < page_size:
             break
         start += page_size
+
     return pd.DataFrame(rows)
 
 
-def hash_uploads(*files):
-    h = hashlib.sha256()
-    for f in files:
-        h.update(f.getvalue())
-    return h.hexdigest()
+def load_dashboard_data(sb) -> pd.DataFrame:
+    sales = read_table(sb, "sales_monthly", "id")
+    if sales.empty:
+        return sales
 
+    customers = read_table(sb, "customer_master", "customer_code")
+    products = read_table(sb, "product_catalog", "item_code")
 
-def add_usd_equivalent(df: pd.DataFrame):
-    """
-    Add a transaction-time USD equivalent without using today's market FX.
+    sales["sales_month"] = pd.to_datetime(sales["sales_month"], errors="coerce")
+    for col in ["qty", "sales_usd", "sales_krw"]:
+        sales[col] = pd.to_numeric(sales[col], errors="coerce").fillna(0)
 
-    Rules:
-    - USD rows: use ERP foreign-currency sales amount directly.
-    - Non-USD rows (e.g. EUR): use booked KRW sales amount divided by an ERP-derived
-      USD/KRW accounting rate for the same transaction date.
-    - If no USD transaction exists on that date, use the median ERP USD/KRW rate
-      for that year-month.
-    - If no suitable USD reference exists, leave USD equivalent blank rather than
-      guessing.
-    """
-    out = df.copy()
-    out["currency"] = out.get("currency", pd.Series(index=out.index, dtype=object)).fillna("").astype(str).str.strip().str.upper()
-    out["fx_rate"] = pd.to_numeric(out.get("fx_rate"), errors="coerce")
-    out["sales_amount_fc"] = pd.to_numeric(out.get("sales_amount_fc"), errors="coerce")
-    out["sales_amount_krw"] = pd.to_numeric(out.get("sales_amount_krw"), errors="coerce").fillna(0)
-    out["txn_date"] = pd.to_datetime(out.get("txn_date"), errors="coerce")
+    if not customers.empty:
+        keep = [
+            c for c in
+            ["customer_code", "customer_name", "country", "region"]
+            if c in customers.columns
+        ]
+        sales = sales.merge(
+            customers[keep],
+            on="customer_code",
+            how="left",
+        )
 
-    sales_mask = out["source_type"].eq("SALES")
-    usd_ref_source = out[
-        sales_mask
-        & out["currency"].eq("USD")
-        & out["fx_rate"].gt(0)
-        & out["txn_date"].notna()
-    ].copy()
+    if not products.empty:
+        keep = [
+            c for c in
+            ["item_code", "item_name", "platform", "category", "product_group"]
+            if c in products.columns
+        ]
+        sales = sales.merge(
+            products[keep],
+            on="item_code",
+            how="left",
+        )
 
-    daily_rate = usd_ref_source.groupby(
-        usd_ref_source["txn_date"].dt.normalize()
-    )["fx_rate"].median()
-
-    monthly_rate = usd_ref_source.groupby(
-        usd_ref_source["txn_date"].dt.to_period("M").astype(str)
-    )["fx_rate"].median()
-
-    date_key = out["txn_date"].dt.normalize()
-    month_key = out["txn_date"].dt.to_period("M").astype(str)
-    out["usd_krw_reference"] = date_key.map(daily_rate)
-    out["usd_krw_reference"] = out["usd_krw_reference"].fillna(month_key.map(monthly_rate))
-
-    out["sales_amount_usd"] = pd.NA
-    usd_sales = sales_mask & out["currency"].eq("USD")
-    out.loc[usd_sales, "sales_amount_usd"] = out.loc[usd_sales, "sales_amount_fc"]
-
-    non_usd_sales = (
-        sales_mask
-        & ~out["currency"].eq("USD")
-        & out["usd_krw_reference"].gt(0)
-    )
-    out.loc[non_usd_sales, "sales_amount_usd"] = (
-        out.loc[non_usd_sales, "sales_amount_krw"]
-        / out.loc[non_usd_sales, "usd_krw_reference"]
-    )
-
-    out["sales_amount_usd"] = pd.to_numeric(out["sales_amount_usd"], errors="coerce")
-    missing_conversion = int(
-        (
-            sales_mask
-            & ~out["currency"].eq("USD")
-            & out["sales_amount_krw"].ne(0)
-            & out["sales_amount_usd"].isna()
-        ).sum()
-    )
-    return out, missing_conversion
+    sales["year"] = sales["sales_month"].dt.year
+    sales["month"] = sales["sales_month"].dt.month
+    return sales
 
 
 require_app_password()
+sb = sb_client()
 
 st.title("Africa Sales DB")
-st.caption("ERP Excel → standardized DB → master data → dashboard")
+st.caption("Sales Report → Monthly Sales DB → Dashboard")
 
-sb = sb_client()
-page = st.sidebar.radio("Menu", ["Dashboard", "ERP Upload", "Country Manager", "Product Master"])
+page = st.sidebar.radio(
+    "Menu",
+    ["Dashboard", "Sales Report Upload"],
+)
+
 
 if page == "Dashboard":
-    df = read_table(sb, "v_sales_enriched")
+    df = load_dashboard_data(sb)
+
     if df.empty:
-        st.info("No sales data yet. Upload ERP files first.")
+        st.info("아직 Sales Report 데이터가 없습니다. 먼저 Sales Report Upload에서 파일을 업로드해주세요.")
         st.stop()
 
-    df["txn_date"] = pd.to_datetime(df["txn_date"], errors="coerce")
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
-    df, missing_usd_conversion = add_usd_equivalent(df)
-
     with st.sidebar:
-        countries = sorted(df["country_name"].dropna().unique().tolist()) if "country_name" in df else []
-        managers = sorted(df["current_manager"].dropna().unique().tolist()) if "current_manager" in df else []
+        years = sorted(df["year"].dropna().astype(int).unique().tolist(), reverse=True)
+        selected_year = st.selectbox("Year", years)
+
+        year_df = df[df["year"].eq(selected_year)].copy()
+
+        countries = sorted(year_df["country"].dropna().astype(str).unique().tolist())
         selected_countries = st.multiselect("Country", countries)
-        selected_managers = st.multiselect("Current Manager", managers)
 
-    view = df.copy()
+        customers = sorted(year_df["customer_name"].dropna().astype(str).unique().tolist())
+        selected_customers = st.multiselect("Customer", customers)
+
+        platforms = sorted(year_df["platform"].dropna().astype(str).unique().tolist())
+        selected_platforms = st.multiselect("Platform", platforms)
+
+    view = year_df.copy()
+
     if selected_countries:
-        view = view[view["country_name"].isin(selected_countries)]
-    if selected_managers:
-        view = view[view["current_manager"].isin(selected_managers)]
+        view = view[view["country"].isin(selected_countries)]
+    if selected_customers:
+        view = view[view["customer_name"].isin(selected_customers)]
+    if selected_platforms:
+        view = view[view["platform"].isin(selected_platforms)]
 
-    sales = view[view["source_type"].eq("SALES")].copy()
-    foc = view[view["source_type"].eq("BL_FOC")]
-    devices = view[view.get("product_category", pd.Series(index=view.index, dtype=str)).eq("Device")]
+    foc_mask = view["sales_usd"].eq(0) & view["qty"].gt(0)
+    category_text = view.get(
+        "category",
+        pd.Series("", index=view.index, dtype="object"),
+    ).fillna("").astype(str)
+    device_mask = category_text.str.contains("기기", na=False)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Sales (KRW)", f"₩{sales['sales_amount_krw'].sum():,.0f}")
-    c2.metric("Sales (USD eq.)", f"${sales['sales_amount_usd'].sum():,.0f}")
-    c3.metric("Sales rows", f"{len(sales):,}")
-    c4.metric("FOC Qty", f"{foc['qty'].sum():,.0f}")
-    c5.metric("Device Qty", f"{devices['qty'].sum():,.0f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sales (USD)", "$" + f"{view['sales_usd'].sum():,.2f}")
+    c2.metric("Sales (KRW)", f"₩{view['sales_krw'].sum():,.0f}")
+    c3.metric("Total Qty", f"{view['qty'].sum():,.0f}")
+    c4.metric("Device Qty", f"{view.loc[device_mask, 'qty'].sum():,.0f}")
 
     st.caption(
-        "USD equivalent uses ERP transaction/accounting FX, not today's exchange rate. "
-        "USD rows use the original foreign-currency sales amount. Non-USD rows are converted "
-        "from booked KRW using the ERP USD/KRW rate on the same date; if unavailable, the "
-        "same month's median ERP USD/KRW rate is used."
+        "USD 매출은 Sales Report의 월별 외화금액을 그대로 사용합니다. "
+        "환율 재계산은 하지 않습니다."
     )
-    if missing_usd_conversion:
-        st.warning(
-            f"{missing_usd_conversion:,} non-USD sales rows could not be converted to USD "
-            "because no ERP USD/KRW reference rate was available for the transaction date/month."
-        )
 
-    st.subheader("Currency Check")
-    currency_summary = (
-        sales.groupby("currency", dropna=False)
+    monthly = (
+        view.groupby("sales_month", as_index=False)
         .agg(
-            rows=("currency", "size"),
-            native_sales=("sales_amount_fc", "sum"),
-            booked_krw=("sales_amount_krw", "sum"),
-            usd_equivalent=("sales_amount_usd", "sum"),
+            sales_usd=("sales_usd", "sum"),
+            sales_krw=("sales_krw", "sum"),
+            qty=("qty", "sum"),
         )
-        .reset_index()
-        .sort_values("booked_krw", ascending=False)
+        .sort_values("sales_month")
     )
-    st.dataframe(currency_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("Monthly Sales")
+    if not monthly.empty:
+        chart_data = monthly.set_index("sales_month")[["sales_usd"]]
+        st.line_chart(chart_data)
 
     st.subheader("Country Summary")
-    qty_summary = (
-        view.groupby(["country_name", "current_manager"], dropna=False)
-        .agg(total_qty=("qty", "sum"))
-        .reset_index()
-    )
-    sales_summary = (
-        sales.groupby(["country_name", "current_manager"], dropna=False)
+    country_summary = (
+        view.groupby("country", dropna=False)
         .agg(
-            sales_krw=("sales_amount_krw", "sum"),
-            sales_usd=("sales_amount_usd", "sum"),
+            sales_usd=("sales_usd", "sum"),
+            sales_krw=("sales_krw", "sum"),
+            qty=("qty", "sum"),
         )
         .reset_index()
+        .sort_values("sales_usd", ascending=False)
     )
-    summary = (
-        qty_summary.merge(
-            sales_summary,
-            on=["country_name", "current_manager"],
-            how="left",
-        )
-        .fillna({"sales_krw": 0, "sales_usd": 0})
-        .sort_values("sales_krw", ascending=False)
-    )
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    st.subheader("Recent Data")
-    show_cols = [c for c in [
-        "txn_date", "country_name", "customer_name", "item_name", "currency", "fx_rate",
-        "qty", "sales_amount_fc", "sales_amount_krw", "sales_amount_usd", "shipment_type",
-        "current_manager", "manager_at_sale"
-    ] if c in view]
     st.dataframe(
-        view.sort_values("txn_date", ascending=False)[show_cols].head(300),
+        country_summary,
         use_container_width=True,
         hide_index=True,
     )
 
-elif page == "ERP Upload":
-    st.header("ERP Upload")
-    st.write("Upload the two ERP exports. The app applies the company rule automatically: Sales rows with blank 기타출고구분 + BL rows with 기타출고구분.")
-    sales_file = st.file_uploader("수출매출품목조회", type=["xlsx", "xls"], key="sales")
-    bl_file = st.file_uploader("수출BL품목조회", type=["xlsx", "xls"], key="bl")
+    st.subheader("FOC Summary")
+    foc = view.loc[foc_mask].copy()
+    if foc.empty:
+        st.write("FOC 출고가 없습니다.")
+    else:
+        foc_summary = (
+            foc.groupby(["country", "customer_name"], dropna=False)
+            .agg(foc_qty=("qty", "sum"))
+            .reset_index()
+            .sort_values("foc_qty", ascending=False)
+        )
+        st.dataframe(
+            foc_summary,
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    if sales_file and bl_file:
-        sales_raw = read_erp_excel(sales_file)
-        bl_raw = read_erp_excel(bl_file)
-        combined, mappings = combine_company_rule(sales_raw, bl_raw)
+    st.subheader("Product Summary")
+    product_summary = (
+        view.groupby(
+            ["item_code", "item_name", "platform", "category"],
+            dropna=False,
+        )
+        .agg(
+            sales_usd=("sales_usd", "sum"),
+            qty=("qty", "sum"),
+        )
+        .reset_index()
+        .sort_values("sales_usd", ascending=False)
+    )
+    st.dataframe(
+        product_summary,
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        missing_country = int(combined["raw_country"].isna().sum())
-        st.success(f"Prepared {len(combined):,} rows. Missing country: {missing_country:,}")
-        st.caption("Detected mapping")
-        st.json(mappings)
-        st.dataframe(combined.head(100), use_container_width=True, hide_index=True)
 
-        if missing_country:
-            st.warning("Some rows have no country. Add/confirm the country column mapping before production use.")
+elif page == "Sales Report Upload":
+    st.header("Sales Report Upload")
+    st.write(
+        "월별 수량 / 외화금액(USD) / 원화금액이 포함된 Sales Report를 업로드하세요. "
+        "거래처는 거래처번호, 제품은 품번을 기준으로 저장합니다."
+    )
+
+    file = st.file_uploader(
+        "Sales Report (.xlsx)",
+        type=["xlsx"],
+        key="sales_report",
+    )
+
+    if file:
+        try:
+            monthly, meta = read_sales_report(file)
+        except Exception as exc:
+            st.error(f"Sales Report를 읽지 못했습니다: {exc}")
+            st.stop()
+
+        st.success(
+            f"{meta['year']}년 데이터 확인 완료 · "
+            f"{meta['monthly_rows']:,} monthly rows · "
+            f"{meta['customer_count']:,} customers · "
+            f"{meta['item_count']:,} products"
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Sales (USD)", "$" + f"{meta['sales_usd']:,.2f}")
+        c2.metric("Sales (KRW)", f"₩{meta['sales_krw']:,.0f}")
+        c3.metric("Months", f"{len(meta['months_detected'])}")
+
+        st.caption(
+            "Invoice와 LOT은 저장하지 않습니다. "
+            "동일한 거래처번호 + 품번 + 월 데이터는 하나로 합산됩니다."
+        )
+
+        st.subheader("Preview")
+        preview_cols = [
+            "sales_month", "country", "customer_name", "customer_code",
+            "item_name", "item_code", "platform", "category",
+            "qty", "sales_usd", "sales_krw",
+        ]
+        st.dataframe(
+            monthly[preview_cols].head(200),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         if st.button("Upload to Supabase", type="primary"):
-            file_hash = hash_uploads(sales_file, bl_file)
-            batch_id, count = insert_sales_batch(
-                sb, combined,
-                source_file=f"{sales_file.name} + {bl_file.name}",
-                file_hash=file_hash,
+            with st.spinner("Uploading Sales Report..."):
+                result = upload_sales_report(
+                    sb,
+                    monthly,
+                    source_file=file.name,
+                )
+
+            st.success(
+                f"완료! "
+                f"Customers {result['customers']:,} · "
+                f"Products {result['products']:,} · "
+                f"Monthly sales {result['sales_rows']:,}"
             )
-            st.success(f"Uploaded {count:,} rows. Batch: {batch_id}")
-
-elif page == "Country Manager":
-    st.header("Country Manager Master")
-    st.write("Upload only the current assignment changes. Previous assignments are closed automatically, so historical ownership remains available.")
-    st.code("Country,Manager,Effective From\nGhana,Haena,2026-01-01\nBotswana,Haena,2026-01-01", language="text")
-    file = st.file_uploader("Manager master (.xlsx or .csv)", type=["xlsx", "csv"], key="manager")
-    if file:
-        if file.name.lower().endswith(".csv"):
-            m = pd.read_csv(file)
-        else:
-            m = pd.read_excel(file)
-        normalized = {str(c).strip().lower(): c for c in m.columns}
-        country_col = normalized.get("country") or normalized.get("국가")
-        manager_col = normalized.get("manager") or normalized.get("담당자")
-        effective_col = normalized.get("effective from") or normalized.get("valid from") or normalized.get("시작일")
-        if not all([country_col, manager_col, effective_col]):
-            st.error("Required columns: Country, Manager, Effective From")
-        else:
-            preview = pd.DataFrame({
-                "country": m[country_col].astype(str).str.strip(),
-                "manager": m[manager_col].astype(str).str.strip(),
-                "effective_from": pd.to_datetime(m[effective_col], errors="coerce"),
-            }).dropna()
-            st.dataframe(preview, use_container_width=True, hide_index=True)
-            if st.button("Apply manager changes", type="primary"):
-                changes = apply_manager_assignments(sb, preview.to_dict("records"))
-                st.success(f"Applied {len(changes)} assignments.")
-                st.dataframe(pd.DataFrame(changes, columns=["Country", "Manager", "Result"]), hide_index=True)
-
-    st.subheader("Current history table")
-    history = sb.table("country_manager_history").select(
-        "valid_from,valid_to,country_master(country_name),manager_master(manager_name)"
-    ).order("valid_from", desc=True).execute().data or []
-    if history:
-        flat = [{
-            "Country": x.get("country_master", {}).get("country_name"),
-            "Manager": x.get("manager_master", {}).get("manager_name"),
-            "Valid From": x.get("valid_from"),
-            "Valid To": x.get("valid_to"),
-        } for x in history]
-        st.dataframe(pd.DataFrame(flat), use_container_width=True, hide_index=True)
-
-elif page == "Product Master":
-    st.header("Product Master")
-    st.write("Manage Device / Reagent / Control / Accessory classification separately from ERP files.")
-    st.code("item_code,item_name,product_category,product_group\nAF10,AFIAS-10,Device,AFIAS\n...,HbA1c Neo,Reagent,Diabetes", language="text")
-    file = st.file_uploader("Product master (.xlsx or .csv)", type=["xlsx", "csv"], key="product")
-    if file:
-        p = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
-        p.columns = [str(c).strip() for c in p.columns]
-        required = {"item_code", "product_category"}
-        if not required.issubset(p.columns):
-            st.error("Required columns: item_code, product_category")
-        else:
-            st.dataframe(p.head(100), use_container_width=True, hide_index=True)
-            if st.button("Update product master", type="primary"):
-                n = upsert_products(sb, p.to_dict("records"))
-                st.success(f"Updated {n:,} products.")
+            st.info("이제 왼쪽 메뉴의 Dashboard에서 결과를 확인하면 됩니다.")
