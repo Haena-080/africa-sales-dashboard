@@ -35,9 +35,23 @@ def sb_client():
         st.stop()
 
 
-def read_table(sb, table: str, columns: str = "*") -> pd.DataFrame:
-    data = sb.table(table).select(columns).execute().data or []
-    return pd.DataFrame(data)
+def read_table(sb, table: str, columns: str = "*", page_size: int = 1000) -> pd.DataFrame:
+    rows = []
+    start = 0
+    while True:
+        batch = (
+            sb.table(table)
+            .select(columns)
+            .range(start, start + page_size - 1)
+            .execute()
+            .data
+            or []
+        )
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return pd.DataFrame(rows)
 
 
 def hash_uploads(*files):
