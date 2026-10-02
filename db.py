@@ -129,7 +129,7 @@ def upload_sales_report(sb: Client, monthly: pd.DataFrame, source_file: str) -> 
     }
 
 
-def upsert_business_plan(sb: Client, plan_df: pd.DataFrame, source_file: str) -> int:
+def upload_business_plan(sb: Client, plan_df: pd.DataFrame, source_file: str) -> int:
     rows = []
     for rec in plan_df.to_dict("records"):
         rows.append({
