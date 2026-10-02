@@ -251,3 +251,105 @@ def read_sales_report(file_obj) -> Tuple[pd.DataFrame, Dict]:
     }
 
     return monthly, meta
+
+
+COUNTRY_ALIASES = {
+    "CABO VERDE": "Cape Verde",
+    "CAPE VERDE": "Cape Verde",
+    "GUINÉ-BISSAU": "Guinea-Bissau",
+    "GUINE-BISSAU": "Guinea-Bissau",
+}
+
+
+def _normalize_country(value):
+    text = _clean_text(value)
+    if not text:
+        return None
+    upper = text.upper()
+    return COUNTRY_ALIASES.get(upper, text)
+
+
+def _country_from_customer(customer):
+    text = _clean_text(customer)
+    if not text:
+        return None
+    if "GUINÉ-BISSAU" in text.upper() or "GUINE-BISSAU" in text.upper():
+        return "Guinea-Bissau"
+    if ";" in text:
+        return _normalize_country(text.rsplit(";", 1)[1].strip())
+    return None
+
+
+def read_business_plan(file_obj) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Read the annual business-plan workbook into one row per manager/customer/month.
+    Expected columns: 팀, 영업담당자, 고객, 1..12, 총합계.
+    Only 아프리카팀 customer detail rows are kept; summary rows are excluded.
+    """
+    if hasattr(file_obj, "seek"):
+        file_obj.seek(0)
+
+    df = pd.read_excel(file_obj, sheet_name=0)
+    df.columns = [_clean_text(c) for c in df.columns]
+
+    required = {"팀", "영업담당자", "고객"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError("사업계획 파일에 필요한 열이 없습니다: " + ", ".join(missing))
+
+    month_cols = {}
+    for month in range(1, 13):
+        candidates = [month, str(month), float(month)]
+        hit = None
+        for c in df.columns:
+            if c in candidates or _clean_text(c) == str(month):
+                hit = c
+                break
+        if hit is None:
+            raise ValueError(f"{month}월 사업계획 열을 찾지 못했습니다.")
+        month_cols[month] = hit
+
+    df["팀"] = df["팀"].map(_clean_text).ffill()
+    df["영업담당자"] = df["영업담당자"].map(_clean_text).ffill()
+    df["고객"] = df["고객"].map(_clean_text)
+
+    detail = df[
+        df["팀"].eq("아프리카팀")
+        & df["고객"].notna()
+        & ~df["영업담당자"].fillna("").str.contains("요약")
+        & ~df["고객"].fillna("").str.contains("요약")
+    ].copy()
+
+    if detail.empty:
+        raise ValueError("아프리카팀 사업계획 상세행을 찾지 못했습니다.")
+
+    # This workbook is the 2026 business plan. If a 4-digit year exists in the
+    # filename later, the UI can pass another year; for the current template use 2026.
+    year = 2026
+    rows = []
+
+    for _, rec in detail.iterrows():
+        customer_name = _clean_text(rec["고객"])
+        manager = _clean_text(rec["영업담당자"])
+        country = _country_from_customer(customer_name)
+
+        for month, col in month_cols.items():
+            plan = pd.to_numeric(pd.Series([rec[col]]), errors="coerce").fillna(0).iloc[0]
+            rows.append({
+                "plan_month": pd.Timestamp(year=year, month=month, day=1).date(),
+                "manager": manager,
+                "customer_name": customer_name,
+                "country": country,
+                "plan_usd": float(plan),
+            })
+
+    plan_df = pd.DataFrame(rows)
+    plan_df["plan_usd"] = pd.to_numeric(plan_df["plan_usd"], errors="coerce").fillna(0).round(2)
+
+    meta = {
+        "year": year,
+        "customers": int(detail["고객"].nunique()),
+        "managers": int(detail["영업담당자"].nunique()),
+        "annual_plan_usd": float(plan_df["plan_usd"].sum()),
+    }
+    return plan_df, meta
